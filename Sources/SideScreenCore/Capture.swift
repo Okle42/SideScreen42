@@ -33,7 +33,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             if target != nil { break }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
-        guard let display = target else { fail("ScreenCaptureKit 找不到虛擬螢幕（displayID=\(displayID)）") }
+        guard let display = target else { throw SideScreenError.displayNotFound }
 
         let cfg = SCStreamConfiguration()
         cfg.width = width
@@ -76,12 +76,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    /// 畫面靜止時 SCK 不送 frame；要關鍵幀時拿最後一張重編
+    /// 要關鍵幀：下一張新畫面直接編成關鍵幀。畫面靜止時 SCK 不送 frame，
+    /// 所以 50ms 內沒有新畫面才拿最後一張重編（網路塞車時不要再多塞一張舊的關鍵幀）
     func keyframeNow() {
         encoder.requestKeyframe()
-        queue.asyncAfter(deadline: .now() + .milliseconds(30)) { [weak self] in
-            guard let self, let buf = self.lastBuffer else { return }
-            // 30ms 內若已有新畫面進來，關鍵幀已經編掉了，這裡多編一次也無妨
+        queue.asyncAfter(deadline: .now() + .milliseconds(50)) { [weak self] in
+            guard let self, self.encoder.keyframePending, let buf = self.lastBuffer else { return }
             let now = CMClockGetTime(CMClockGetHostTimeClock())
             let pts = CMTimeMaximum(now, self.lastPTS + CMTime(value: 1, timescale: 1000))
             self.lastPTS = pts
@@ -106,7 +106,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("擷取中斷：\(error.localizedDescription)")
-        self.stream = nil
+        queue.async { self.stream = nil }
         onStopped?()
     }
 

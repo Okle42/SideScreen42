@@ -27,7 +27,7 @@ I had a Surface Laptop 2 sitting next to my Mac mini doing nothing. Its Mini Dis
 └───────────────────────────────────┘            └──────────────────────────────┘
 ```
 
-- **Sender**: a ~700-line Swift package using Apple frameworks only, no third-party dependencies. It builds with the Command Line Tools; you don't need an Xcode project.
+- **Sender**: a Swift package using Apple frameworks only, no third-party dependencies: a shared core (`SideScreenCore`), a **menu bar app** (`SideScreen42.app`) and a command-line tool (`sidescreen`). It builds with the Command Line Tools; you don't need an Xcode project.
 - **Receiver**: a single HTML file. Open it from disk in Edge or Chrome (`file://` counts as a secure context, so WebCodecs works). Nothing to install on the laptop, and it isn't tied to Windows.
 
 ## Measured
@@ -39,31 +39,58 @@ Sender cost, from `tools/bench.sh`: 20 s idle, then 20 s with a full-screen 60 f
 | | before tuning | after tuning |
 |---|---|---|
 | CPU, nobody connected | 1.8 % | **0.1 %** |
-| CPU, streaming 60 fps | 5.8 % | 6.1 % |
+| CPU, streaming 60 fps | 5.8 % | 5.7–6.1 % |
 | Frames delivered at 60 fps content | 57.5 fps | **60.0 fps** |
-| Capture → frame on the socket, average | 4.8 ms | **1.2–1.3 ms** |
-| Capture → frame on the socket, p95 | 10.7 ms | **2.3–2.6 ms** |
+| Encode time per frame (avg / max) | — | **9.0 / 10.7 ms** |
+| Socket hand-off → sent, worst frame | — | **≤ 1 ms** (local) |
 | Memory (RSS) | 44 MB | 44 MB |
 
-"After" is two consecutive runs. Latency is measured on the Mac itself: the timestamp in every frame is the capture host time, and the local client reads the same clock, so the difference covers capture, encode and send. It does not include Wi‑Fi or decoding.
+Encode and send times are measured inside the process with one monotonic clock. Across Wi‑Fi, the "worst frame" figure is what tells you if the network stalled.
+
+**A correction.** The first version of this README said "capture → frame on the socket, 1.2 ms". That number came from comparing each frame's timestamp with the local client's clock. ScreenCaptureKit's timestamp turned out to carry an offset that drifts over time (the same build read −4 ms a few hours later), so the absolute value was wrong. The real Mac-side cost is about 10 ms: encode plus send. The before/after comparison still holds, because both runs shared the same offset: fixing the capture interval removed about 8 ms of p95 jitter. I also tried the regular hardware encoder (`ave.avc`) instead of the low-latency one (`h264.rtvc`): 15–16 ms per frame, slower, so the low-latency one stays.
 
 Receiver side (Edge on the Surface, reported by its own stats): hardware decoding, **1–2 ms per frame** (about 43 ms for the very first keyframe), no decode errors, no dropped frames in the test run.
 
 **Not measured yet:** true glass-to-glass latency across Wi‑Fi. The two machines' clocks aren't synchronised, so that needs a slow-motion phone video of both screens. Subjectively, dragging windows feels immediate.
 
+### From a night of real use
+
+The log of one 4-hour evening (one connection, never dropped):
+
+- The screen was mostly still: median capture rate **3 fps**, average 8.4. Idling when nothing changes is where the savings are.
+- 438 frames were dropped by the sender's backpressure, in 43 five-second windows, clustered in a few busy minutes. A few happened at only 2–3 fps, which means a single frame sat on Wi‑Fi for over a second. That looks like the laptop's Wi‑Fi power saving, not the Mac.
+- The log exposed a bug: when backpressure dropped a frame, the keyframe request **re-encoded the last (stale) frame as an extra keyframe**, the largest kind of frame, at exactly the moment the network was congested. Now the next fresh frame becomes the keyframe, and the stale frame is re-encoded only if nothing new arrives within 50 ms (a static screen).
+- The stats line now records keyframes, encode time and the slowest send, and only logs when something is moving (plus a heartbeat), so a whole night stays readable.
+
 ### What the tuning was
 
 1. **Idle when nobody is watching.** With no client connected, nothing is encoded and capture drops to 2 fps, just enough to always hold the latest frame. When a client connects, capture goes back to 60 fps and that held frame is encoded as a keyframe right away, so the picture appears in about 40 ms even if the screen is static.
-2. **Capture interval 10 % looser than 1/fps.** With `minimumFrameInterval` set to exactly 1/60 s, tiny jitter in display timing made ScreenCaptureKit skip about 4 % of frames, and the skipped frames delayed the ones after them. The display still caps capture at 60 Hz. This one change took p95 latency from 10.7 ms to 2.5 ms.
+2. **Capture interval 10 % looser than 1/fps.** With `minimumFrameInterval` set to exactly 1/60 s, tiny jitter in display timing made ScreenCaptureKit skip about 4 % of frames, and the skipped frames delayed the ones after them. The display still caps capture at 60 Hz. This one change removed about 8 ms of p95 jitter.
 3. **Zero-copy packet assembly.** The encoder writes the 9-byte header, SPS/PPS and the Annex B body straight into the final WebSocket message. Before, it was copied twice.
 4. **`serviceClass = .interactiveVideo`** on the socket, so Wi‑Fi (WMM) puts it in the video queue.
 5. **Backpressure.** If 3 frames are still unsent, non-key frames are dropped and the next frame is forced to a keyframe. It drops frames rather than letting latency build up.
 
 ## Run it
 
+### Menu bar app
+
 ```bash
 git clone https://github.com/Okle42/SideScreen42.git
 cd SideScreen42
+scripts/make-app.sh          # builds, signs and installs /Applications/SideScreen42.app, then opens it
+```
+
+The first time, macOS asks for **Screen & System Audio Recording** permission for SideScreen42. Allow it and choose **Quit & Reopen**. After that the app starts sharing on its own.
+
+The menu bar icon shows the state by shape: one display = sharing, waiting for a viewer; two displays = someone is watching; crossed out = stopped. The menu has the current viewer and fps, **Copy receiver address**, **Stop / Start sharing**, **Show receiver page in Finder**, About, Settings… (⌘,) and Quit.
+
+Settings: resolution, bitrate, port (changing them restarts sharing; the receiver reconnects by itself), **Open at Login** (off by default), start sharing when the app opens, show in menu bar, and the log file (`~/Library/Logs/SideScreen42/sidescreen.log`, appended, rotated at 5 MB).
+
+The script signs with your Apple Development or Developer ID certificate if you have one, so the Screen Recording permission survives rebuilds. Without one it signs ad hoc, and you may have to allow it again after each rebuild.
+
+### Command line
+
+```bash
 swift build -c release
 .build/release/sidescreen
 ```
@@ -71,14 +98,16 @@ swift build -c release
 It prints something like:
 
 ```
-➜ 在 Surface 上連線：ws://192.168.1.20:8765/stream
+➜ 在接收端連線：ws://192.168.1.20:8765/stream
 ```
 
-On the laptop, open `receiver/index.html` in Edge or Chrome, paste that address and press Connect. Press **F** (or double-click) for full screen, **S** for stats, **C** to show or hide the connection panel. The address is remembered, and the page reconnects on its own.
+### On the laptop
+
+Open `receiver/index.html` in Edge or Chrome, paste that address and press Connect. Press **F** (or double-click) for full screen, **S** for stats, **C** to show or hide the connection panel. The address is remembered, and the page reconnects on its own.
 
 Then open **System Settings → Displays → Arrange** on the Mac and drag `SideScreen (Surface)` to where the laptop physically sits. macOS remembers the position, because the virtual display always uses the same serial number.
 
-Options:
+Command-line Options:
 
 | | |
 |---|---|
@@ -88,11 +117,11 @@ Options:
 | `--mode 1504x1003` | default mode in points (HiDPI): `1504x1003` looks like Windows at 150 %, `1128x752` is pixel-exact and sharpest, `1880x1253` gives more room |
 | `--dump out.h264` | also write the raw stream to a file (`ffplay out.h264`) |
 
-Ctrl+C removes the virtual display, and its windows move back to your other screens. If capture is stopped from outside (for example the **Stop Sharing** button in the macOS menu bar, which names your terminal app), sidescreen restarts it after 3 seconds; use Ctrl+C to actually quit.
+Quitting (or Ctrl+C) removes the virtual display, and its windows move back to your other screens. If capture is stopped from outside (for example the **Stop Sharing** button in the macOS menu bar, which names the app that is recording), it restarts after 3 seconds. To actually stop, use **Stop sharing** in the menu, or Ctrl+C for the command-line tool.
 
 ### Permissions
 
-- **Screen Recording**: System Settings → Privacy & Security → Screen & System Audio Recording. Allow the terminal app you run it from (Terminal, Ghostty, iTerm…).
+- **Screen Recording**: System Settings → Privacy & Security → Screen & System Audio Recording. Allow SideScreen42, or for the command-line tool the terminal app you run it from (Terminal, Ghostty, iTerm…).
 - **Firewall**: allow incoming connections if macOS asks the first time.
 
 ### Tests and tools
@@ -100,7 +129,7 @@ Ctrl+C removes the virtual display, and its windows move back to your other scre
 | | |
 |---|---|
 | `node tools/test_client.mjs ws://<ip>:8765/stream` | protocol self-test: config before the first frame, first frame is a keyframe with SPS/PPS/IDR, `codec` string matches the SPS, monotonic timestamps, keyframe-on-request, reconnect |
-| `tools/bench.sh` | the CPU / memory / latency measurement above |
+| `tools/bench.sh` | the CPU / memory / encode-time measurement above |
 | `swift tools/testpattern.swift 20` | full-screen 60 fps test pattern on the virtual display for 20 s (a moving bar, 60 blinking cells for counting dropped frames, a millisecond clock) |
 
 ## Protocol

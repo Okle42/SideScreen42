@@ -11,8 +11,9 @@ final class Server {
     private static let maxInflight = 3
 
     var onKeyframeRequest: (() -> Void)?
-    var onClientChange: ((Bool) -> Void)?
-    var stats = (sent: 0, dropped: 0, bytes: 0)
+    var onClientChange: ((String?) -> Void)?
+    var onFatal: ((Error) -> Void)?
+    private var stats = (sent: 0, dropped: 0, bytes: 0, keyframes: 0, maxSendMs: 0.0)
 
     private let port: UInt16
     private var listener: NWListener?
@@ -21,7 +22,7 @@ final class Server {
         self.port = port
     }
 
-    func start() {
+    func start() throws {
         let ws = NWProtocolWebSocket.Options()
         ws.autoReplyPing = true
         ws.maximumMessageSize = 64 * 1024 * 1024
@@ -31,22 +32,18 @@ final class Server {
             tcp.noDelay = true
         }
         params.defaultProtocolStack.applicationProtocols.insert(ws, at: 0)
-        let l: NWListener
-        do {
-            l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
-        } catch {
-            fail("無法在 port \(port) 開伺服器：\(error)")
-        }
+        let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
         listener = l
-        l.stateUpdateHandler = { [port] state in
+        l.stateUpdateHandler = { [weak self, port] state in
             switch state {
             case .ready:
                 log("伺服器已就緒，port \(port)")
             case .failed(let e):
                 if case .posix(let code) = e, code == .EADDRINUSE {
-                    fail("port \(port) 已被其他程式占用（lsof -nP -iTCP:\(port) 可查），請改用 --port 其他號碼")
+                    self?.onFatal?(SideScreenError.portInUse(port))
+                } else {
+                    self?.onFatal?(SideScreenError.server("\(e)"))
                 }
-                fail("伺服器失敗：\(e)")
             default: break
             }
         }
@@ -71,7 +68,7 @@ final class Server {
                     old.cancel()
                 }
                 self.client = conn
-                self.onClientChange?(true)
+                self.onClientChange?(Self.describe(conn.endpoint))
                 self.inflight = 0
                 self.needsKeyframe = true
                 log("用戶端已連線：\(conn.endpoint)")
@@ -95,7 +92,7 @@ final class Server {
         if client === conn {
             client = nil
             log("用戶端已斷線")
-            onClientChange?(false)
+            onClientChange?(nil)
         }
     }
 
@@ -150,15 +147,20 @@ final class Server {
                 }
                 return
             }
-            if f.isKeyframe { needsKeyframe = false }
+            if f.isKeyframe { needsKeyframe = false; stats.keyframes += 1 }
 
             let msg = f.message
+            let t0 = DispatchTime.now().uptimeNanoseconds
 
             inflight += 1
             let ctx = NWConnection.ContentContext(identifier: "frame",
                                                   metadata: [NWProtocolWebSocket.Metadata(opcode: .binary)])
             conn.send(content: msg, contentContext: ctx, isComplete: true, completion: .contentProcessed { [weak self] _ in
-                self?.inflight -= 1
+                guard let self else { return }
+                self.inflight -= 1
+                // 從交給 socket 到送完的時間：Wi‑Fi 卡住時這裡會變大
+                let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+                if ms > self.stats.maxSendMs { self.stats.maxSendMs = ms }
             })
             stats.sent += 1
             stats.bytes += msg.count
@@ -173,10 +175,15 @@ final class Server {
 
     var hasClient: Bool { queue.sync { client != nil } }
 
-    func takeStats() -> (sent: Int, dropped: Int, bytes: Int, connected: Bool) {
+    static func describe(_ e: NWEndpoint) -> String {
+        if case .hostPort(let host, _) = e { return "\(host)" }
+        return "\(e)"
+    }
+
+    func takeStats() -> (sent: Int, dropped: Int, bytes: Int, keyframes: Int, maxSendMs: Double, client: String?) {
         queue.sync {
-            defer { stats = (0, 0, 0) }
-            return (stats.sent, stats.dropped, stats.bytes, client != nil)
+            defer { stats = (0, 0, 0, 0, 0) }
+            return (stats.sent, stats.dropped, stats.bytes, stats.keyframes, stats.maxSendMs, client.map { Self.describe($0.endpoint) })
         }
     }
 }

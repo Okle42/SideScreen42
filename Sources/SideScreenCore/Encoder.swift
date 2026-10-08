@@ -2,12 +2,12 @@ import CoreMedia
 import Foundation
 import VideoToolbox
 
-struct EncodedFrame {
+public struct EncodedFrame {
     let isKeyframe: Bool
     /// 完整的二進位訊息：flags(1) + timestamp_us(8, BE) + Annex B，編碼時一次組好，傳送端不再複製
     let message: Data
     let codec: String?      // 只有關鍵幀會帶（從 SPS 取出）
-    var annexB: Data { message.subdata(in: 9..<message.count) }
+    public var annexB: Data { message.subdata(in: 9..<message.count) }
 }
 
 /// VideoToolbox H.264 硬體編碼，輸出 Annex B（關鍵幀前附 SPS/PPS）
@@ -18,11 +18,14 @@ final class Encoder {
     private let lock = NSLock()
     private var forceNext = true
     var onFrame: ((EncodedFrame) -> Void)?
+    /// 編碼耗時統計（畫面交給編碼器 → 編好），單位 ms
+    private var encodeSum = 0.0, encodeMax = 0.0, encodeN = 0
 
-    init(width: Int, height: Int, fps: Int, bitrateMbps: Double) {
+    init(width: Int, height: Int, fps: Int, bitrateMbps: Double) throws {
         self.width = Int32(width)
         self.height = Int32(height)
 
+        // 低延遲碼率控制會選到 rtvc 即時編碼器：實測 2256×1504 每幀 9 ms，一般的 ave.avc 要 15–16 ms
         let spec: [CFString: Any] = [
             kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true,
             kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true,
@@ -42,7 +45,7 @@ final class Encoder {
                 imageBufferAttributes: nil, compressedDataAllocator: nil,
                 outputCallback: nil, refcon: nil, compressionSessionOut: &s)
         }
-        guard st == noErr, let session = s else { fail("建立硬體 H.264 編碼器失敗（\(st)）") }
+        guard st == noErr, let session = s else { throw SideScreenError.encoderCreateFailed(st) }
         self.session = session
 
         let bps = bitrateMbps * 1_000_000
@@ -75,6 +78,18 @@ final class Encoder {
         log("H.264 編碼器：\(width)x\(height) @\(fps)，\(bitrateMbps) Mbps，\(encoderID)")
     }
 
+    /// 已要求關鍵幀、但還沒有新畫面把它編掉
+    var keyframePending: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return forceNext
+    }
+
+    /// 回傳這段期間的（平均, 最大）編碼耗時並歸零
+    func takeEncodeStats() -> (avg: Double, max: Double) {
+        lock.lock(); defer { encodeSum = 0; encodeMax = 0; encodeN = 0; lock.unlock() }
+        return (encodeN > 0 ? encodeSum / Double(encodeN) : 0, encodeMax)
+    }
+
     func requestKeyframe() {
         lock.lock(); forceNext = true; lock.unlock()
     }
@@ -83,11 +98,16 @@ final class Encoder {
         guard let session else { return }
         lock.lock(); let force = forceNext; forceNext = false; lock.unlock()
         let opts: CFDictionary? = force ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
+        let t0 = DispatchTime.now().uptimeNanoseconds
         let st = VTCompressionSessionEncodeFrame(
             session, imageBuffer: pixelBuffer, presentationTimeStamp: pts, duration: .invalid,
             frameProperties: opts, infoFlagsOut: nil
         ) { [weak self] status, _, sample in
             guard status == noErr, let sample, let self else { return }
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000
+            self.lock.lock()
+            self.encodeSum += ms; self.encodeN += 1; self.encodeMax = max(self.encodeMax, ms)
+            self.lock.unlock()
             self.handle(sample)
         }
         if st != noErr {

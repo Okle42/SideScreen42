@@ -1,13 +1,8 @@
 import Foundation
+import SideScreenCore
 
 struct Options {
-    var port: UInt16 = 8765
-    var bitrateMbps: Double = 12
-    var fps: Int = 60
-    var dumpPath: String?
-    var mode = "1504x1003"          // 虛擬螢幕預設模式（point）
-    var width = 2256                // 編碼輸出像素（Surface 實體解析度）
-    var height = 1504
+    var config = StreamerConfig()
 
     static func parse(_ args: [String]) -> Options {
         var o = Options()
@@ -19,11 +14,11 @@ struct Options {
         }
         while i < args.count {
             switch args[i] {
-            case "--port": o.port = UInt16(next()) ?? o.port
-            case "--bitrate": o.bitrateMbps = Double(next()) ?? o.bitrateMbps
-            case "--fps": o.fps = Int(next()) ?? o.fps
-            case "--dump": o.dumpPath = next()
-            case "--mode": o.mode = next()
+            case "--port": o.config.port = UInt16(next()) ?? o.config.port
+            case "--bitrate": o.config.bitrateMbps = Double(next()) ?? o.config.bitrateMbps
+            case "--fps": o.config.fps = Int(next()) ?? o.config.fps
+            case "--dump": o.config.dumpPath = next()
+            case "--mode": o.config.mode = next()
             case "-h", "--help":
                 print("""
                 用法：sidescreen [--port 8765] [--bitrate 12] [--fps 60] [--mode 1504x1003] [--dump out.h264]
@@ -43,14 +38,4 @@ struct Options {
 func fail(_ msg: String) -> Never {
     FileHandle.standardError.write(("錯誤：" + msg + "\n").data(using: .utf8)!)
     exit(1)
-}
-
-private let logFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "HH:mm:ss.SSS"
-    return f
-}()
-
-func log(_ msg: String) {
-    print("[\(logFormatter.string(from: Date()))] \(msg)")
 }

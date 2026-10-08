@@ -19,5 +19,7 @@ c0=$(cpu)
 R=$(node tools/bench_client.mjs ws://127.0.0.1:$PORT/stream 20)
 c1=$(cpu)
 echo "串流（60fps 測試圖）：CPU $(echo "($c1-$c0)/20*100" | bc -l | xargs printf '%.1f')%  RSS $(rss) MB  $R"
+# 程式內部量的真實耗時（同一個時鐘，沒有偏移）：編碼 平均/最大、單幀送出最大
+grep -E "送出 [1-9][0-9]\.[0-9] fps" /tmp/sidescreen_bench.log | tail -3 | sed -E 's/.*(編碼 [^｜]+)｜(最慢送出 [^｜]+).*/  內部耗時：\1，\2/'
 wait $TP 2>/dev/null
 kill -INT $PID; wait $PID 2>/dev/null
