@@ -20,6 +20,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/SideScreen42"
 cp receiver/index.html "$APP/Contents/Resources/SideScreen-receiver.html"
+cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -28,6 +29,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>SideScreen42</string>
   <key>CFBundleIdentifier</key><string>com.okle42.sidescreen42</string>
   <key>CFBundleExecutable</key><string>SideScreen42</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleDevelopmentRegion</key><string>zh-Hant</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
