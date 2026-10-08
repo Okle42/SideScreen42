@@ -14,6 +14,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var fps = 60
     /// 沒有用戶端時待機：不編碼，擷取降到每秒 2 張（只為了手上永遠有最新畫面可以立刻編關鍵幀）
     private var active = true
+    /// 擷取被系統停掉時通知（例如按了選單列的「停止共享」）
+    var onStopped: (() -> Void)?
     private static let idleInterval = CMTime(value: 1, timescale: 2)
     /// 間隔設剛好 1/fps 時，畫面時間的微小抖動會讓 SCK 丟掉約 4% 的幀；放寬 10%，實際仍受螢幕 60 Hz 限制
     private static func activeInterval(_ fps: Int) -> CMTime { CMTime(value: 10, timescale: CMTimeScale(fps * 11)) }
@@ -53,6 +55,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         try await s.startCapture()
         stream = s
+        queue.sync { active = true }
         log("開始擷取虛擬螢幕 → \(width)x\(height) NV12")
     }
 
@@ -103,6 +106,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("擷取中斷：\(error.localizedDescription)")
+        self.stream = nil
+        onStopped?()
     }
 
     /// 給統計用，回傳後歸零

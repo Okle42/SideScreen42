@@ -76,16 +76,26 @@ for sig in [SIGINT, SIGTERM, SIGHUP] {
     signalSources.append(src)
 }
 
-Task {
-    do {
-        try await capture.start(displayID: display!.displayID, width: opts.width, height: opts.height, fps: opts.fps)
-        if dumpHandle == nil && !server.hasClient { capture.setActive(false) }
-    } catch {
-        log("無法擷取螢幕：\(error.localizedDescription)")
-        log("請到「系統設定 → 隱私權與安全性 → 螢幕與系統錄音」允許目前使用的終端機 App，然後重新執行")
-        shutdown()
+func startCapture() {
+    Task {
+        do {
+            try await capture.start(displayID: display!.displayID, width: opts.width, height: opts.height, fps: opts.fps)
+            capture.setActive(server.hasClient || dumpHandle != nil)
+            if server.hasClient { capture.keyframeNow() }
+        } catch {
+            log("無法擷取螢幕：\(error.localizedDescription)")
+            log("請到「系統設定 → 隱私權與安全性 → 螢幕與系統錄音」允許目前使用的終端機 App，然後重新執行")
+            shutdown()
+        }
     }
 }
+// 被「停止共享」之類的動作停掉時自動接回；真的要結束請按 Ctrl+C
+capture.onStopped = {
+    guard !shuttingDown else { return }
+    log("擷取被系統停止，3 秒後自動重新開始（要結束請按 Ctrl+C）")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if !shuttingDown { startCapture() } }
+}
+startCapture()
 
 // 每 5 秒印一次統計
 let statTimer = DispatchSource.makeTimerSource(queue: .main)

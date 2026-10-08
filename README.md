@@ -88,7 +88,7 @@ Options:
 | `--mode 1504x1003` | default mode in points (HiDPI): `1504x1003` looks like Windows at 150 %, `1128x752` is pixel-exact and sharpest, `1880x1253` gives more room |
 | `--dump out.h264` | also write the raw stream to a file (`ffplay out.h264`) |
 
-Ctrl+C removes the virtual display, and its windows move back to your other screens.
+Ctrl+C removes the virtual display, and its windows move back to your other screens. If capture is stopped from outside (for example the **Stop Sharing** button in the macOS menu bar, which names your terminal app), sidescreen restarts it after 3 seconds; use Ctrl+C to actually quit.
 
 ### Permissions
 
