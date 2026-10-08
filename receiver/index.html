@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SideScreen 接收端</title>
+<style>
+  :root {
+    --bg: #000;
+    --panel: rgba(22, 22, 26, 0.94);
+    --text: #ececf1;
+    --muted: #9b9ba6;
+    --accent: #4c8dff;
+    --border: rgba(255, 255, 255, 0.14);
+  }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, "Microsoft JhengHei", sans-serif;
+    overflow: hidden;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    object-fit: contain;
+    display: block;
+  }
+  :root:fullscreen body.streaming { cursor: none; }
+  #panel {
+    position: fixed;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: min(460px, calc(100vw - 32px));
+    box-sizing: border-box;
+    padding: 24px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+  body.streaming #panel:not(.pinned) { display: none; }
+  h1 { margin: 0 0 4px; font-size: 20px; font-weight: 600; }
+  #status { margin: 0 0 16px; color: var(--muted); min-height: 1.5em; }
+  form { display: flex; gap: 8px; }
+  input {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 10px;
+    background: #111;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: 13px ui-monospace, Consolas, monospace;
+  }
+  button {
+    padding: 8px 16px;
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 8px;
+    font: inherit;
+    cursor: pointer;
+  }
+  .hint { margin: 16px 0 0; color: var(--muted); font-size: 12px; }
+  kbd {
+    padding: 1px 5px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font: 11px ui-monospace, Consolas, monospace;
+  }
+  #stats {
+    position: fixed;
+    top: 8px;
+    right: 8px;
+    margin: 0;
+    padding: 8px 10px;
+    background: rgba(0, 0, 0, 0.72);
+    color: #d6f5d6;
+    border-radius: 8px;
+    font: 12px/1.45 ui-monospace, Consolas, monospace;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="screen" width="2256" height="1504"></canvas>
+
+<div id="panel">
+  <h1>SideScreen</h1>
+  <p id="status" aria-live="polite">尚未連線</p>
+  <form id="form">
+    <input id="url" spellcheck="false" autocomplete="off" placeholder="ws://<Mac IP>:8765/stream" aria-label="Mac 的 WebSocket 網址">
+    <button type="submit">連線</button>
+  </form>
+  <p class="hint">
+    <kbd>F</kbd> 或按兩下畫面：全螢幕
+    <kbd>S</kbd> 統計
+    <kbd>C</kbd> 顯示／隱藏此面板
+  </p>
+</div>
+
+<pre id="stats" hidden></pre>
+
+<script>
+'use strict';
+
+const DEFAULT_URL = '';  // 第一次開啟時輸入 sidescreen 印出的網址，之後會記住
+const MAX_DECODE_QUEUE = 3;
+
+const $ = (id) => document.getElementById(id);
+const canvas = $('screen');
+const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+
+function loadUrl() {
+  const fromQuery = new URLSearchParams(location.search).get('ws');
+  if (fromQuery) return fromQuery;
+  try { return localStorage.getItem('sidescreen.url') || DEFAULT_URL; } catch { return DEFAULT_URL; }
+}
+function saveUrl(value) {
+  try { localStorage.setItem('sidescreen.url', value); } catch {}
+}
+
+let url = loadUrl();
+$('url').value = url;
+
+let ws = null;
+let retryTimer = null;
+let retryDelay = 500;
+let decoder = null;
+let decoderConfig = null;
+let waitingKey = true;
+let streaming = false;
+let lastKeyRequest = 0;
+let lastError = '';
+let wakeLock = null;
+
+// 每秒統計（per）與累計（total）
+const per = { rx: 0, rxBytes: 0, decoded: 0, dropped: 0, latSum: 0, latN: 0, latMax: 0 };
+const total = { rx: 0, decoded: 0, dropped: 0, errors: 0, keyframes: 0, keyRequests: 0, reconnects: 0 };
+const recvTime = new Map(); // chunk timestamp → 收到時間，用來量解碼延遲
+
+function setStatus(text) { $('status').textContent = text; }
+
+function setStreaming(on) {
+  streaming = on;
+  document.body.classList.toggle('streaming', on);
+  if (on) requestWakeLock();
+}
+
+function send(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function requestKeyframe(force = false) {
+  const now = performance.now();
+  if (!force && now - lastKeyRequest < 200) return;
+  lastKeyRequest = now;
+  total.keyRequests++;
+  send({ type: 'keyframe' });
+}
+
+// ---------- 連線 ----------
+
+function connect() {
+  clearTimeout(retryTimer);
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  setStatus(`連線中… ${url}`);
+
+  let sock;
+  try {
+    sock = new WebSocket(url);
+  } catch (e) {
+    setStatus(`網址格式錯誤：${e.message}`);
+    return;
+  }
+  sock.binaryType = 'arraybuffer';
+  ws = sock;
+
+  sock.onopen = () => {
+    retryDelay = 500;
+    setStatus('已連線，等待畫面…');
+    send({
+      type: 'hello',
+      client: 'surface',
+      width: Math.round(screen.width * devicePixelRatio),
+      height: Math.round(screen.height * devicePixelRatio),
+    });
+  };
+  sock.onmessage = (e) => {
+    if (typeof e.data === 'string') onText(e.data);
+    else onFrame(e.data);
+  };
+  sock.onclose = () => {
+    if (ws !== sock) return;
+    ws = null;
+    setStreaming(false);
+    resetDecoder();
+    total.reconnects++;
+    setStatus(`連線中斷，${(retryDelay / 1000).toFixed(1)} 秒後重試…`);
+    retryTimer = setTimeout(connect, retryDelay);
+    retryDelay = Math.min(retryDelay * 2, 5000);
+  };
+}
+
+function onText(text) {
+  let msg;
+  try { msg = JSON.parse(text); } catch { return; }
+  if (msg.type === 'config') applyConfig(msg);
+}
+
+// ---------- 解碼 ----------
+
+async function pickDecoderConfig(msg) {
+  const base = {
+    codec: msg.codec,
+    codedWidth: msg.width,
+    codedHeight: msg.height,
+    optimizeForLatency: true,
+  };
+  for (const hardwareAcceleration of ['prefer-hardware', 'no-preference']) {
+    const cfg = { ...base, hardwareAcceleration };
+    try {
+      if ((await VideoDecoder.isConfigSupported(cfg)).supported) return cfg;
+    } catch {}
+  }
+  return null;
+}
+
+async function applyConfig(msg) {
+  if (!('VideoDecoder' in window)) {
+    setStatus('這個瀏覽器不支援 WebCodecs，請用新版 Edge 或 Chrome 開啟');
+    return;
+  }
+  const cfg = await pickDecoderConfig(msg);
+  if (!cfg) {
+    setStatus(`這台電腦無法解碼 ${msg.codec}（${msg.width}×${msg.height}）`);
+    return;
+  }
+  decoderConfig = cfg;
+  if (canvas.width !== msg.width || canvas.height !== msg.height) {
+    canvas.width = msg.width;
+    canvas.height = msg.height;
+  }
+  resetDecoder();
+  // 解碼器建好前到的關鍵幀已經丟掉了，一定要再要一個，不能被節流擋下
+  requestKeyframe(true);
+}
+
+function resetDecoder() {
+  if (decoder && decoder.state !== 'closed') decoder.close();
+  decoder = null;
+  waitingKey = true;
+  recvTime.clear();
+  if (!decoderConfig) return;
+  decoder = new VideoDecoder({ output: onDecoded, error: onDecodeError });
+  decoder.configure(decoderConfig);
+}
+
+function onFrame(buf) {
+  if (buf.byteLength < 10) return;
+  const view = new DataView(buf);
+  const key = (view.getUint8(0) & 1) === 1;
+  const timestamp = Number(view.getBigUint64(1, false));
+
+  per.rx++; total.rx++;
+  per.rxBytes += buf.byteLength;
+  if (key) total.keyframes++;
+
+  const drop = () => { per.dropped++; total.dropped++; };
+  if (!decoder || decoder.state !== 'configured') return drop();
+  if (!key && waitingKey) return drop();
+  if (!key && decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
+    // 解碼跟不上：丟掉這段 P-frame，從下一個關鍵幀重新開始
+    waitingKey = true;
+    requestKeyframe();
+    return drop();
+  }
+
+  waitingKey = false;
+  recvTime.set(timestamp, performance.now());
+  try {
+    decoder.decode(new EncodedVideoChunk({
+      type: key ? 'key' : 'delta',
+      timestamp,
+      data: new Uint8Array(buf, 9),
+    }));
+  } catch (e) {
+    onDecodeError(e);
+  }
+}
+
+function onDecoded(frame) {
+  const t0 = recvTime.get(frame.timestamp);
+  if (t0 !== undefined) {
+    const lat = performance.now() - t0;
+    per.latSum += lat; per.latN++;
+    per.latMax = Math.max(per.latMax, lat);
+    recvTime.delete(frame.timestamp);
+  }
+  if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+    canvas.width = frame.displayWidth;
+    canvas.height = frame.displayHeight;
+  }
+  ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+  frame.close();
+  per.decoded++; total.decoded++;
+  if (!streaming) {
+    setStreaming(true);
+    setStatus('播放中');
+  }
+}
+
+function onDecodeError(e) {
+  total.errors++;
+  lastError = e && e.message ? e.message : String(e);
+  console.warn('[SideScreen] 解碼錯誤：', lastError);
+  resetDecoder();
+  requestKeyframe();
+}
+
+// ---------- 統計 ----------
+
+setInterval(() => {
+  const snapshot = {
+    fps: per.decoded,
+    rxFps: per.rx,
+    mbps: +(per.rxBytes * 8 / 1e6).toFixed(2),
+    decodeMsAvg: per.latN ? +(per.latSum / per.latN).toFixed(1) : null,
+    decodeMsMax: per.latN ? +per.latMax.toFixed(1) : null,
+    droppedPerSec: per.dropped,
+    queue: decoder ? decoder.decodeQueueSize : 0,
+    codec: decoderConfig ? decoderConfig.codec : null,
+    hardwareAcceleration: decoderConfig ? decoderConfig.hardwareAcceleration : null,
+    size: `${canvas.width}x${canvas.height}`,
+    connected: !!(ws && ws.readyState === WebSocket.OPEN),
+    lastError,
+    total: { ...total },
+  };
+  window.sideScreenStats = snapshot;
+
+  if (!$('stats').hidden) {
+    $('stats').textContent = [
+      `畫面    ${snapshot.size}  ${snapshot.codec || '-'}`,
+      `解碼器  ${snapshot.hardwareAcceleration || '-'}`,
+      `fps     ${snapshot.fps}（收到 ${snapshot.rxFps}）`,
+      `流量    ${snapshot.mbps} Mbps`,
+      `解碼    平均 ${snapshot.decodeMsAvg ?? '-'} ms／最高 ${snapshot.decodeMsMax ?? '-'} ms`,
+      `佇列    ${snapshot.queue}　丟幀 ${snapshot.droppedPerSec}/s`,
+      `累計    關鍵幀 ${total.keyframes}　錯誤 ${total.errors}　重連 ${total.reconnects}`,
+      lastError ? `最後錯誤 ${lastError}` : '',
+    ].filter(Boolean).join('\n');
+  }
+
+  for (const k in per) per[k] = 0;
+}, 1000);
+
+// ---------- 介面 ----------
+
+$('form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  url = $('url').value.trim();
+  saveUrl(url);
+  retryDelay = 500;
+  $('panel').classList.remove('pinned');
+  connect();
+});
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
+}
+
+canvas.addEventListener('dblclick', toggleFullscreen);
+
+document.addEventListener('keydown', (e) => {
+  if (e.target instanceof HTMLInputElement) return;
+  const k = e.key.toLowerCase();
+  if (k === 'f') toggleFullscreen();
+  else if (k === 's') $('stats').hidden = !$('stats').hidden;
+  else if (k === 'c') $('panel').classList.toggle('pinned');
+});
+
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator) || wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && streaming) requestWakeLock();
+});
+
+if (url) connect();
+else setStatus('輸入 Mac 上 sidescreen 印出的網址');
+</script>
+</body>
+</html>
